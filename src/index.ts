@@ -1,11 +1,11 @@
 import { Bot, InputFile } from "grammy";
-import ytdl from "ytdl-core";
+import ytdl from "@distube/ytdl-core";
 import ytsr from "ytsr";
 import { spawn } from "child_process";
 import { existsSync, unlinkSync, mkdirSync, statSync } from "fs";
 import { join } from "path";
 
-const BOT_TOKEN = process.env.BOT_TOKEN || "8617936912:AAHi-SDAaO1lkhWerCFW8W3QMRUhmO0TB4Y";
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const TMP_DIR = process.env.TMP_DIR || "./tmp";
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
@@ -36,31 +36,57 @@ function cleanupFile(filePath: string) {
   try { unlinkSync(filePath); } catch {}
 }
 
+// ─── Search YouTube (direct search, no filters) ───────────────────
+
 async function searchYouTube(query: string): Promise<{ title: string; url: string; duration: string; channel: string } | null> {
   try {
-    const filters = await ytsr.getFilters(query);
-    const filter = filters.get("Type")?.get("Video");
-    if (!filter) return null;
+    console.log(`[Search] Query: "${query}"`);
 
-    const results = await ytsr(filter.url, { limit: 1 });
-    if (!results.items.length) return null;
+    // Search directly without getFilters (which is broken)
+    const results = await ytsr(query, {
+      limit: 5,
+      gl: "US",
+      hl: "en",
+    });
 
-    const v = results.items[0] as any;
+    // Find first video result
+    const video = results.items.find((item: any) => item.type === "video") as any;
+
+    if (!video || !video.url) {
+      console.log("[Search] No video found in results");
+      return null;
+    }
+
+    console.log(`[Search] Found: "${video.title}" -> ${video.url}`);
     return {
-      title: v.title?.substring(0, 100) || "Unknown",
-      url: v.url || "",
-      duration: v.duration || "0:00",
-      channel: v.author?.name || "Unknown",
+      title: video.title?.substring(0, 100) || "Unknown",
+      url: video.url,
+      duration: video.duration || "0:00",
+      channel: video.author?.name || video.channel?.name || "Unknown",
     };
   } catch (err: any) {
-    console.error("Search error:", err.message);
+    console.error("[Search] Error:", err.message);
     return null;
   }
 }
 
+// ─── Download audio via ytdl-core + ffmpeg ────────────────────────
+
 function downloadAudio(videoId: string, outputPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const stream = ytdl(videoId, { quality: "highestaudio", filter: "audioonly" });
+    console.log(`[Download] Starting for video: ${videoId}`);
+
+    const stream = ytdl(videoId, {
+      quality: "highestaudio",
+      filter: "audioonly",
+      highWaterMark: 1 << 25, // 32MB buffer
+      requestOptions: {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        },
+      },
+    });
+
     const ff = spawn("ffmpeg", [
       "-i", "pipe:0",
       "-vn",
@@ -76,12 +102,96 @@ function downloadAudio(videoId: string, outputPath: string): Promise<void> {
     let stderr = "";
     ff.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
     ff.on("close", (code: number) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg exited with code ${code}: ${stderr.slice(-200)}`));
+      if (code === 0) {
+        console.log(`[Download] Done: ${outputPath}`);
+        resolve();
+      }
+      else reject(new Error(`ffmpeg exited with code ${code}: ${stderr.slice(-300)}`));
     });
-    ff.on("error", reject);
-    stream.on("error", reject);
+    ff.on("error", (err) => reject(new Error(`ffmpeg error: ${err.message}`)));
+    stream.on("error", (err) => reject(new Error(`ytdl stream error: ${err.message}`)));
   });
+}
+
+// ─── Get video info with retry ────────────────────────────────────
+
+async function getVideoInfo(videoId: string): Promise<ytdl.videoInfo> {
+  console.log(`[Info] Fetching info for: ${videoId}`);
+  const info = await ytdl.getInfo(videoId, {
+    requestOptions: {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+    },
+  });
+  console.log(`[Info] Title: "${info.videoDetails.title}"`);
+  return info;
+}
+
+// ─── Process & send audio (shared logic) ──────────────────────────
+
+async function processAndSend(ctx: any, videoUrl: string, waitMsgId: number) {
+  const videoId = extractVideoId(videoUrl);
+  if (!videoId) {
+    return await ctx.api.editMessageText(ctx.chat.id, waitMsgId, "❌ Invalid YouTube URL.");
+  }
+
+  let info: ytdl.videoInfo;
+  try {
+    info = await getVideoInfo(videoId);
+  } catch (err: any) {
+    console.error("[Info] Error:", err.message);
+    return await ctx.api.editMessageText(ctx.chat.id, waitMsgId,
+      "❌ Could not get video info.\n\nThe video may be:\n• Age-restricted\n• Private / Unlisted\n• Region-locked\n• Or YouTube has blocked the request.\n\nTry a different video or a direct YouTube link.");
+  }
+
+  const title = info.videoDetails.title.replace(/[<>:"/\\|?*]/g, "").substring(0, 100);
+  const duration = parseInt(info.videoDetails.lengthSeconds);
+  const durationStr = formatDuration(duration);
+
+  if (duration > 600) {
+    return await ctx.api.editMessageText(ctx.chat.id, waitMsgId,
+      `⚠️ **"${title}"** is too long (${durationStr}).\nMax: 10 minutes.`, { parse_mode: "Markdown" });
+  }
+
+  await ctx.api.editMessageText(ctx.chat.id, waitMsgId,
+    `📥 Downloading: **${title.substring(0, 60)}**\n⏱ ${durationStr}`, { parse_mode: "Markdown" });
+
+  const outputPath = join(TMP_DIR, `${videoId}.mp3`);
+
+  try {
+    await downloadAudio(videoId, outputPath);
+  } catch (err: any) {
+    console.error("[Download] Error:", err.message);
+    cleanupFile(outputPath);
+    return await ctx.api.editMessageText(ctx.chat.id, waitMsgId,
+      "❌ Download failed. Video may be restricted or ffmpeg is not installed.\n\nMake sure **ffmpeg** is installed: `sudo apt install ffmpeg`");
+  }
+
+  const fileSize = statSync(outputPath).size;
+  if (fileSize > MAX_FILE_SIZE) {
+    cleanupFile(outputPath);
+    return await ctx.api.editMessageText(ctx.chat.id, waitMsgId,
+      `❌ File too large (${(fileSize / 1024 / 1024).toFixed(1)}MB). Max: 50MB.`);
+  }
+
+  await ctx.api.deleteMessage(ctx.chat.id, waitMsgId);
+
+  try {
+    await ctx.replyWithAudio(new InputFile(outputPath, `${title}.mp3`), {
+      title,
+      performer: info.videoDetails.author.name,
+      duration,
+      caption: `🎵 **${title}**\n⏱ ${durationStr}\n🎤 ${info.videoDetails.author.name}`,
+      parse_mode: "Markdown",
+    });
+    console.log(`[Send] Sent: "${title}" (${(fileSize / 1024 / 1024).toFixed(1)}MB)`);
+  } catch (err: any) {
+    console.error("[Send] Error:", err.message);
+    await ctx.reply("❌ Failed to send audio file. It may be too large for Telegram.");
+  }
+
+  cleanupFile(outputPath);
 }
 
 // ─── Command: /start ──────────────────────────────────────────────
@@ -122,64 +232,17 @@ bot.command("play", async (ctx) => {
   const isUrl = isYTUrl(query);
   const waitMsg = await ctx.reply(isUrl ? "📥 Downloading audio..." : "🔍 Searching...");
 
-  let videoUrl: string;
-
   if (isUrl) {
-    videoUrl = query;
+    await processAndSend(ctx, query, waitMsg.message_id);
   } else {
     const result = await searchYouTube(query);
     if (!result || !result.url) {
-      return await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id, "❌ No results found.");
-    }
-    videoUrl = result.url;
-  }
-
-  const videoId = extractVideoId(videoUrl);
-  if (!videoId) {
-    return await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id, "❌ Invalid YouTube URL.");
-  }
-
-  try {
-    const info = await ytdl.getInfo(videoId);
-    const title = info.videoDetails.title.replace(/[<>:"/\\|?*]/g, "").substring(0, 100);
-    const duration = parseInt(info.videoDetails.lengthSeconds);
-    const durationStr = formatDuration(duration);
-
-    if (duration > 600) {
       return await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id,
-        `⚠️ **"${title}"** is too long (${durationStr}).\nMax: 10 minutes.`, { parse_mode: "Markdown" });
+        "❌ No results found.\n\n💡 Try:\n• A more specific song name\n• Include the artist name\n• Or paste a YouTube URL directly");
     }
-
     await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id,
-      `📥 Downloading: **${title.substring(0, 60)}**\n⏱ ${durationStr}`, { parse_mode: "Markdown" });
-
-    const outputPath = join(TMP_DIR, `${videoId}.mp3`);
-    await downloadAudio(videoId, outputPath);
-
-    const fileSize = statSync(outputPath).size;
-    if (fileSize > MAX_FILE_SIZE) {
-      cleanupFile(outputPath);
-      return await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id,
-        `❌ File too large (${(fileSize / 1024 / 1024).toFixed(1)}MB). Max: 50MB.`);
-    }
-
-    await ctx.api.deleteMessage(ctx.chat.id, waitMsg.message_id);
-
-    await ctx.replyWithAudio(new InputFile(outputPath, `${title}.mp3`), {
-      title,
-      performer: "YouTube Music",
-      duration,
-      caption: `🎵 **${title}**\n⏱ ${durationStr}`,
-      parse_mode: "Markdown",
-    });
-
-    cleanupFile(outputPath);
-  } catch (err: any) {
-    console.error("Play error:", err.message);
-    try {
-      await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id,
-        "❌ Failed to download. Video may be restricted or unavailable.");
-    } catch {}
+      `✅ Found: **${result.title.substring(0, 50)}**\n⏱ ${result.duration}\n🎤 ${result.channel}\n\n📥 Downloading...`, { parse_mode: "Markdown" });
+    await processAndSend(ctx, result.url, waitMsg.message_id);
   }
 });
 
@@ -194,57 +257,17 @@ bot.on("message:text", async (ctx) => {
   if (!videoId) return;
 
   const waitMsg = await ctx.reply("📥 Downloading audio...");
-
-  try {
-    const info = await ytdl.getInfo(videoId);
-    const title = info.videoDetails.title.replace(/[<>:"/\\|?*]/g, "").substring(0, 100);
-    const duration = parseInt(info.videoDetails.lengthSeconds);
-    const durationStr = formatDuration(duration);
-
-    if (duration > 600) {
-      return await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id,
-        `⚠️ Video is too long (${durationStr}). Max: 10 minutes.`);
-    }
-
-    await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id,
-      `📥 Downloading: **${title.substring(0, 60)}**\n⏱ ${durationStr}`, { parse_mode: "Markdown" });
-
-    const outputPath = join(TMP_DIR, `${videoId}.mp3`);
-    await downloadAudio(videoId, outputPath);
-
-    const fileSize = statSync(outputPath).size;
-    if (fileSize > MAX_FILE_SIZE) {
-      cleanupFile(outputPath);
-      return await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id,
-        `❌ File too large (${(fileSize / 1024 / 1024).toFixed(1)}MB). Max: 50MB.`);
-    }
-
-    await ctx.api.deleteMessage(ctx.chat.id, waitMsg.message_id);
-
-    await ctx.replyWithAudio(new InputFile(outputPath, `${title}.mp3`), {
-      title,
-      performer: "YouTube Music",
-      duration,
-      caption: `🎵 **${title}**\n⏱ ${durationStr}`,
-      parse_mode: "Markdown",
-    });
-
-    cleanupFile(outputPath);
-  } catch (err: any) {
-    console.error("URL handler error:", err.message);
-    try {
-      await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id,
-        "❌ Failed to download. Video may be restricted or unavailable.");
-    } catch {}
-  }
+  await processAndSend(ctx, text, waitMsg.message_id);
 });
 
 // ─── Start Bot ────────────────────────────────────────────────────
 
 console.log("🎵 YouTube Music Bot starting...");
-bot.catch((err) => console.error("Bot error:", err));
+console.log(`[Config] TMP_DIR: ${TMP_DIR}`);
+console.log(`[Config] MAX_FILE_SIZE: ${(MAX_FILE_SIZE / 1024 / 1024)}MB`);
+
+bot.catch((err) => console.error("[Bot] Error:", err));
 
 bot.start({
   onStart: (info) => console.log(`✅ Bot @${info.username} is running!`),
 });
-  
